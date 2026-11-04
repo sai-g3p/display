@@ -192,7 +192,7 @@ class HWCDisplay : public DisplayEventHandler {
     std::multiset<HWCLayer *, SortLayersByZ> layer_set;  // Maintain a set sorted by Z
   };
 
-  virtual ~HWCDisplay() {}
+  virtual ~HWCDisplay();
   virtual int Init();
   virtual int Deinit();
 
@@ -612,6 +612,9 @@ class HWCDisplay : public DisplayEventHandler {
   uint32_t geometry_changes_on_doze_suspend_ = GeometryChanges::kNone;
 #ifdef OPLUS_FINGERPRINT_MASK
   uint32_t last_fod_mask_ = 0;
+  bool last_fp_press_ = false;
+  int oplus_display_fd_ = -1;
+  void NotifyFpPress(bool pressed);
 #endif
   bool first_cycle_ = true;  // false if a display commit has succeeded on the device.
   shared_ptr<Fence> release_fence_ = nullptr;

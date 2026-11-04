@@ -49,6 +49,10 @@
 #include "hwc_session.h"
 
 #ifdef OPLUS_FINGERPRINT_MASK
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 // SurfaceFlinger hands the HWC layers the name of their gralloc buffer ("NAME" metadata),
 // e.g. "VRI[UdfpsControllerOverlay]#15(BLAST Consumer)15" for the UDFPS prompt window and
 // "SurfaceView[UdfpsControllerOverlay]#16(BLAST Consumer)16" for the pressed icon. Match the
@@ -58,6 +62,7 @@
 #define OPLUS_UDFPS_DIM_NAME "Dim Layer for UDFPS"
 #define OPLUS_UDFPS_DIM_LAYER_BIT 0x1
 #define OPLUS_UDFPS_PRESSED_LAYER_BIT 0x2
+#define OPLUS_PANEL_IOCTL_SET_FP_PRESS 0x40046f29  // _IOW('o', 0x29, unsigned int)
 #endif
 
 #if __has_include("pxlw_color_mode_config.h")
@@ -514,6 +519,19 @@ HWCDisplay::HWCDisplay(CoreInterface *core_intf, BufferAllocator *buffer_allocat
   buffer_allocator_ = static_cast<HWCBufferAllocator *>(buffer_allocator);
 }
 
+HWCDisplay::~HWCDisplay() {
+#ifdef OPLUS_FINGERPRINT_MASK
+  if (display_class_ == DISPLAY_CLASS_BUILTIN && last_fp_press_) {
+    last_fp_press_ = false;
+    NotifyFpPress(false);
+  }
+  if (oplus_display_fd_ >= 0) {
+    close(oplus_display_fd_);
+    oplus_display_fd_ = -1;
+  }
+#endif
+}
+
 int HWCDisplay::Init() {
   DisplayError error = kErrorNone;
 
@@ -644,6 +662,17 @@ int HWCDisplay::Deinit() {
     delete tone_mapper_;
     tone_mapper_ = nullptr;
   }
+
+#ifdef OPLUS_FINGERPRINT_MASK
+  if (display_class_ == DISPLAY_CLASS_BUILTIN && last_fp_press_) {
+    last_fp_press_ = false;
+    NotifyFpPress(false);
+  }
+  if (oplus_display_fd_ >= 0) {
+    close(oplus_display_fd_);
+    oplus_display_fd_ = -1;
+  }
+#endif
 
   return 0;
 }
@@ -898,6 +927,14 @@ void HWCDisplay::BuildLayerStack() {
   }
 
 #ifdef OPLUS_FINGERPRINT_MASK
+  if (display_class_ == DISPLAY_CLASS_BUILTIN) {
+    bool fp_press = (layer_stack_.flags.fod_mask & OPLUS_UDFPS_PRESSED_LAYER_BIT) != 0;
+    if (fp_press != last_fp_press_) {
+      last_fp_press_ = fp_press;
+      NotifyFpPress(fp_press);
+    }
+  }
+
   if (last_fod_mask_ != layer_stack_.flags.fod_mask) {
     last_fod_mask_ = layer_stack_.flags.fod_mask;
     std::ostringstream os;
@@ -949,6 +986,12 @@ void HWCDisplay::BuildSolidFillStack() {
   layer_stack_.client_incompatible =
       dump_frame_count_ && (dump_output_to_file_ || dump_input_layers_);
   DLOGV_IF(kTagClient, "layer_stack_.client_incompatible : %d", layer_stack_.client_incompatible);
+#ifdef OPLUS_FINGERPRINT_MASK
+  if (display_class_ == DISPLAY_CLASS_BUILTIN && last_fp_press_) {
+    last_fp_press_ = false;
+    NotifyFpPress(false);
+  }
+#endif
 }
 
 HWC3::Error HWCDisplay::SetLayerType(LayerId layer_id, LayerType type) {
@@ -1047,6 +1090,12 @@ HWC3::Error HWCDisplay::SetPowerMode(PowerMode mode, bool teardown) {
       if (tone_mapper_) {
         tone_mapper_->Terminate();
       }
+#ifdef OPLUS_FINGERPRINT_MASK
+      if (display_class_ == DISPLAY_CLASS_BUILTIN && last_fp_press_) {
+        last_fp_press_ = false;
+        NotifyFpPress(false);
+      }
+#endif
       break;
     case PowerMode::ON:
       if (mmrm_restricted_ && (display_class_ != DISPLAY_CLASS_BUILTIN) &&
@@ -2712,7 +2761,7 @@ void HWCDisplay::Dump(std::ostringstream *os) {
   *os << "\n------------HWC----------------\n";
   *os << "HWC3 display_id: " << id_ << std::endl;
 #ifdef OPLUS_FINGERPRINT_MASK
-  *os << "UDFPS mask: " << layer_stack_.flags.fod_mask << std::endl;
+  *os << "UDFPS mask: " << layer_stack_.flags.fod_mask << ", fp_press: " << last_fp_press_ << std::endl;
 #endif
   for (auto layer : layer_set_) {
     auto sdm_layer = layer->GetSDMLayer();
@@ -3866,5 +3915,45 @@ bool HWCDisplay::NotifyIdleNow() {
 
   return false;
 }
+
+#ifdef OPLUS_FINGERPRINT_MASK
+void HWCDisplay::NotifyFpPress(bool pressed) {
+  static const char *kOplusDisplayDev = "/dev/oplus_display";
+  static const char *kOplusDisplaySysfs = "/sys/kernel/oplus_display/notify_fppress";
+
+  uint32_t val = pressed ? 1 : 0;
+  bool success = false;
+
+  if (oplus_display_fd_ < 0) {
+    oplus_display_fd_ = open(kOplusDisplayDev, O_RDWR | O_CLOEXEC);
+  }
+
+  if (oplus_display_fd_ >= 0) {
+    if (ioctl(oplus_display_fd_, OPLUS_PANEL_IOCTL_SET_FP_PRESS, &val) == 0) {
+      success = true;
+    } else {
+      DLOGW("ioctl PANEL_IOCTL_SET_FP_PRESS failed: %s (%d)", strerror(errno), errno);
+      close(oplus_display_fd_);
+      oplus_display_fd_ = -1;
+    }
+  }
+
+  if (!success) {
+    int sysfs_fd = open(kOplusDisplaySysfs, O_WRONLY | O_CLOEXEC);
+    if (sysfs_fd >= 0) {
+      char buf[8];
+      int len = snprintf(buf, sizeof(buf), "%u\n", val);
+      if (write(sysfs_fd, buf, len) > 0) {
+        success = true;
+      }
+      close(sysfs_fd);
+    } else {
+      DLOGW("Failed to open %s: %s (%d)", kOplusDisplaySysfs, strerror(errno), errno);
+    }
+  }
+
+  DLOGI("NotifyFpPress: %u, success = %d", val, success);
+}
+#endif
 
 }  // namespace sdm
